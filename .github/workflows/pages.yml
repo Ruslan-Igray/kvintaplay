@@ -1,0 +1,76 @@
+name: Publish Kvinta to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Unpack application source
+        run: unzip -q kvinta-github-source.zip -d app
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Run checks
+        run: node app/tests/all.test.mjs
+      - name: Read application version
+        id: version
+        run: node -e "require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'app_version=' + require('./app/package.json').version + '\n')"
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload application
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: app/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish site
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify public application
+        env:
+          PAGES_URL: ${{ steps.deployment.outputs.page_url }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.app_version }}
+        run: |
+          curl --fail --location --retry 6 --retry-delay 10 --retry-all-errors "$PAGES_URL" -o "$RUNNER_TEMP/kvinta-live.html"
+          grep -q 'Квинта' "$RUNNER_TEMP/kvinta-live.html"
+          curl --fail --location --retry 6 --retry-delay 10 --retry-all-errors "${PAGES_URL}app.js" -o "$RUNNER_TEMP/kvinta-live.js"
+          grep -q 'createChordLibrary' "$RUNNER_TEMP/kvinta-live.js"
+          curl --fail --location "${PAGES_URL}manifest.webmanifest" -o "$RUNNER_TEMP/kvinta-manifest.json"
+          curl --fail --location "${PAGES_URL}sw.js" -o "$RUNNER_TEMP/kvinta-live-sw.js"
+          for attempt in 1 2 3 4 5 6; do
+            curl --fail --location --retry 2 --retry-all-errors "${PAGES_URL}version.json?release=${GITHUB_SHA}-${attempt}" -o "$RUNNER_TEMP/kvinta-version.json"
+            curl --fail --location --retry 2 --retry-all-errors "${PAGES_URL}modules/app-version.js?release=${GITHUB_SHA}-${attempt}" -o "$RUNNER_TEMP/kvinta-app-version.js"
+            if node -e "const fs=require('fs'),p=process.env.RUNNER_TEMP; if(JSON.parse(fs.readFileSync(p+'/kvinta-version.json')).version!==process.env.EXPECTED_VERSION || !fs.readFileSync(p+'/kvinta-app-version.js','utf8').includes(\"APP_VERSION='\"+process.env.EXPECTED_VERSION+\"'\")) process.exit(1)"; then
+              echo "Published version $EXPECTED_VERSION verified."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Published version did not match $EXPECTED_VERSION."
+          exit 1
